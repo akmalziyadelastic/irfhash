@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""
+irfHASH CLI & Zero-Leak Agentic Middleware
+Isolated Runtime Fortress: Hardened Agentic Secret Hub
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from typing import List
+
+from vault_manager import IrfHashVault
+
+
+def cmd_list(vault: IrfHashVault, args: List[str]):
+    cat = vault.load_catalog()
+    conns = list(cat.get("connections", {}).values())
+    if "--json" in args:
+        print(json.dumps(conns, indent=2))
+        return
+
+    settings = vault.load_settings()
+    custom_dom = settings.get("custom_domain", "irfhash.localhost")
+    port = settings.get("dashboard_port", 8765)
+
+    status_order = {"ACTIVE": 1, "CONFIGURED": 2, "UNVERIFIED": 3, "EXPIRED": 4}
+    conns.sort(key=lambda c: (status_order.get(c.get("status", ""), 5), c.get("system", ""), c.get("name", "")))
+
+    print("=" * 145)
+    print(
+        f"{'ID':<30} | {'EDITABLE NAME':<34} | {'SYS':<13} | {'ENV':<6} | {'STATUS':<10} | {'MASKED KEY':<20} | {'URL'}"
+    )
+    print("=" * 145)
+    for c in conns:
+        cid = c.get("id", "")[:30]
+        name = c.get("name", "")[:34]
+        sys_name = c.get("system", "")[:13]
+        env = c.get("environment", "")[:6]
+        st = c.get("status", "")[:10]
+        masked = c.get("masked_preview", "")[:20]
+        url = c.get("url", "")
+        print(f"{cid:<30} | {name:<34} | {sys_name:<13} | {env:<6} | {st:<10} | {masked:<20} | {url}")
+    print("=" * 145)
+    active_cnt = sum(1 for c in conns if c.get("status") == "ACTIVE")
+    exp_cnt = sum(1 for c in conns if c.get("status") == "EXPIRED")
+    cfg_cnt = sum(1 for c in conns if c.get("status") == "CONFIGURED")
+    print(
+        f"Total: {len(conns)} connections ({active_cnt} ACTIVE, {cfg_cnt} CONFIGURED, {exp_cnt} EXPIRED) | "
+        f"Dashboard: http://{custom_dom}:{port} (or http://127.0.0.1:{port})"
+    )
+
+
+def cmd_add(vault: IrfHashVault, args: List[str]):
+    parser = argparse.ArgumentParser(prog="irfhash add")
+    parser.add_argument("--id", required=True, help="Unique connection slug ID (e.g. slack-bot, jira-main)")
+    parser.add_argument("--name", required=True, help="Editable friendly name")
+    parser.add_argument("--system", default="custom", help="System category (slack, jira, github, notion, stripe, etc.)")
+    parser.add_argument("--url", required=True, help="Base URL or endpoint")
+    parser.add_argument("--env", default="TEST", help="Environment (TEST, UAT, DEV, PROD, PERSONAL)")
+    parser.add_argument("--auth-type", default="Bearer", help="ApiKey, Bearer, Basic, CustomHeader, OAuth2Client")
+    parser.add_argument("--header-name", default="Authorization", help="HTTP Header name")
+    parser.add_argument("--header-prefix", default=None, help="HTTP Header prefix (e.g. 'ApiKey ', 'Bearer ')")
+    parser.add_argument("--secret", default=None, help="Secret/API key (or pipe via stdin)")
+    parser.add_argument("--notes", default="", help="Reference notes")
+    parser.add_argument("--sanitize", action="store_true", help="Immediately redact this secret from AI chat logs")
+    parsed = parser.parse_args(args)
+
+    sec = parsed.secret
+    if not sec and not sys.stdin.isatty():
+        sec = sys.stdin.read().strip()
+
+    prefix = parsed.header_prefix
+    if prefix is None:
+        if parsed.auth_type == "ApiKey":
+            prefix = "ApiKey "
+        elif parsed.auth_type == "Bearer":
+            prefix = "Bearer "
+        else:
+            prefix = ""
+
+    extra_headers = {}
+    if parsed.system.lower() == "search-cluster":
+        extra_headers["kbn-xsrf"] = "true"
+    elif parsed.system.lower() == "diagram-api":
+        extra_headers["X-Api-Version"] = "1"
+
+    entry = vault.upsert_connection(
+        conn_id=parsed.id,
+        name=parsed.name,
+        system=parsed.system,
+        url=parsed.url,
+        environment=parsed.env,
+        auth_type=parsed.auth_type,
+        secret_value=sec,
+        header_name=parsed.header_name,
+        header_prefix=prefix,
+        extra_headers=extra_headers,
+        notes=parsed.notes,
+        actor="cli-add",
+    )
+    if sec:
+        entry = vault.verify_connection(parsed.id, actor="cli-add")
+    print(
+        f"Added & encrypted '{entry['name']}' ({entry['id']}) | Status: {entry['status']} ({entry.get('status_detail', '')}) | Masked: {entry['masked_preview']}"
+    )
+    if parsed.sanitize:
+        res = vault.sanitize_chats(dry_run=False, actor="cli-add-sanitize")
+        print(f"Sanitized chat logs: redacted {res['total_redactions']} secret occurrences across {res['files_with_secrets']} files.")
+
+
+def cmd_sanitize(vault: IrfHashVault, args: List[str]):
+    dry = "--dry-run" in args or "-n" in args
+    res = vault.sanitize_chats(dry_run=dry, actor="cli-sanitize")
+    mode = "DRY RUN (Preview)" if dry else "SANITIZED & REDACTED"
+    print(f"[{mode}] Scanned {res['files_scanned']} AI chat/session files.")
+    print(f"Found & replaced {res['total_redactions']} raw secret occurrences across {res['files_with_secrets']} files.")
+    if res["affected_connections"]:
+        print("Redacted connections (replaced with AI-readable irfHASH pointers):")
+        for cid, cnt in sorted(res["affected_connections"].items()):
+            print(f"  - {cid}: {cnt} occurrences replaced")
+
+
+def cmd_domain(vault: IrfHashVault, args: List[str]):
+    if not args:
+        s = vault.load_settings()
+        dom = s.get("custom_domain", "irfhash.localhost")
+        port = s.get("dashboard_port", 8765)
+        print(f"Current custom local URL: http://{dom}:{port}")
+        return
+    dom = args[0]
+    map_hosts = "--map-hosts" in args or "-m" in args
+    res = vault.configure_custom_domain(dom, map_etc_hosts=map_hosts)
+    print(f"Configured URL: {res['url']}")
+    print(f"Zero-config .localhost URL: {res['fallback_localhost_url']}")
+    print(f"Status: {res['message']}")
+
+
+def cmd_scan( args: List[str]):
+    from scan_and_import import main as run_scan
+
+    sys.argv = ["scan_and_import.py"] + args
+    run_scan()
+
+
+def cmd_request(vault: IrfHashVault, args: List[str]):
+    parser = argparse.ArgumentParser(prog="irfhash request")
+    parser.add_argument("conn_id", help="Connection ID from irfhash list")
+    parser.add_argument("method", help="HTTP method (GET, POST, PUT, DELETE, PATCH)")
+    parser.add_argument("path_or_url", help="API path (e.g. /api/status) or full URL")
+    parser.add_argument("-d", "--data", default=None, help="Request JSON body string or @filepath")
+    parser.add_argument("-H", "--header", action="append", default=[], help="Extra Header: Value")
+    parsed = parser.parse_args(args)
+
+    body = parsed.data
+    if body and body.startswith("@") and os.path.exists(body[1:]):
+        with open(body[1:], "r", encoding="utf-8") as f:
+            body = f.read()
+
+    extra_headers = {}
+    for h in parsed.header:
+        if ":" in h:
+            k, v = h.split(":", 1)
+            extra_headers[k.strip()] = v.strip()
+
+    res = vault.execute_http_request(
+        conn_id=parsed.conn_id,
+        method=parsed.method,
+        path_or_url=parsed.path_or_url,
+        body=body,
+        extra_headers=extra_headers,
+        actor="agent-cli",
+    )
+    if not res.get("ok") and res.get("error"):
+        sys.stderr.write(f"[irfHASH Error] {res['error']}\n")
+        if res.get("body"):
+            print(res["body"])
+        sys.exit(1)
+    print(res.get("body", ""))
+
+
+def cmd_jira(vault: IrfHashVault, args: List[str]):
+    """Executes jira CLI with JIRA_API_TOKEN injected in-memory from vault and output scrubbed."""
+    conn_id = None
+    cat = vault.load_catalog()
+    for cid, c in cat.get("connections", {}).items():
+        if c.get("system") == "jira" and c.get("status") == "ACTIVE":
+            conn_id = cid
+            break
+    if not conn_id:
+        for cid, c in cat.get("connections", {}).items():
+            if c.get("system") == "jira":
+                conn_id = cid
+                break
+    if not conn_id:
+        sys.stderr.write("[irfHASH Error] No Jira connection found in vault. Add one via 'irfhash add'.\n")
+        sys.exit(1)
+
+    is_write = any(w in args for w in ("create", "edit", "move", "assign", "comment", "delete", "transition"))
+    target_str = "jira " + " ".join(args)
+    allowed, reason = vault.check_and_authorize(
+        conn_id, "WRITE" if is_write else "READ", target_str, is_write=is_write, actor="agent-jira"
+    )
+    if not allowed:
+        sys.stderr.write(f"[irfHASH Blocked] {reason}\n")
+        sys.exit(1)
+
+    sec_obj = vault._get_secret_obj(conn_id)
+    token = sec_obj.get("secret", "")
+    if not token:
+        sys.stderr.write(f"[irfHASH Error] No secret found in vault for {conn_id}\n")
+        sys.exit(1)
+
+    env = os.environ.copy()
+    env["JIRA_API_TOKEN"] = token
+
+    stdin_data = None
+    if not sys.stdin.isatty():
+        stdin_data = sys.stdin.read()
+
+    proc = subprocess.run(
+        ["jira"] + args,
+        env=env,
+        input=stdin_data,
+        capture_output=True,
+        text=True,
+    )
+    vault.log_audit(
+        "CLI_JIRA",
+        conn_id,
+        "ALLOWED" if proc.returncode == 0 else f"EXIT_{proc.returncode}",
+        target=vault.scrub_output(target_str),
+        method="WRITE" if is_write else "READ",
+        actor="agent-jira",
+    )
+    if proc.stdout:
+        sys.stdout.write(vault.scrub_output(proc.stdout))
+    if proc.stderr:
+        sys.stderr.write(vault.scrub_output(proc.stderr))
+    sys.exit(proc.returncode)
+
+
+def cmd_exec(vault: IrfHashVault, args: List[str]):
+    """irfhash exec <conn_id> <ENV_VAR_NAME> <command> [args...]"""
+    if len(args) < 3:
+        sys.stderr.write("Usage: irfhash exec <conn_id> <ENV_VAR_NAME> <command> [args...]\n")
+        sys.exit(1)
+    conn_id = args[0]
+    env_var = args[1]
+    cmd = args[2:]
+
+    target_str = " ".join(cmd)
+    allowed, reason = vault.check_and_authorize(conn_id, "EXEC", target_str, is_write=False, actor="agent-exec")
+    if not allowed:
+        sys.stderr.write(f"[irfHASH Blocked] {reason}\n")
+        sys.exit(1)
+
+    sec_obj = vault._get_secret_obj(conn_id)
+    secret_val = sec_obj.get("secret", "")
+    env = os.environ.copy()
+    env[env_var] = secret_val
+
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    vault.log_audit(
+        "CLI_EXEC",
+        conn_id,
+        "ALLOWED",
+        f"Injected {env_var} (exit {proc.returncode})",
+        method="EXEC",
+        target=vault.scrub_output(target_str),
+        actor="agent-exec",
+    )
+    if proc.stdout:
+        sys.stdout.write(vault.scrub_output(proc.stdout))
+    if proc.stderr:
+        sys.stderr.write(vault.scrub_output(proc.stderr))
+    sys.exit(proc.returncode)
+
+
+def cmd_verify(vault: IrfHashVault, args: List[str]):
+    cat = vault.load_catalog()
+    conns = cat.get("connections", {})
+    targets = [args[0]] if args else list(conns.keys())
+    for cid in targets:
+        if cid not in conns:
+            print(f"Unknown connection ID: {cid}")
+            continue
+        entry = vault.verify_connection(cid, timeout=8, actor="cli-verify")
+        print(f"[{entry['status']:<10}] {cid:<30} | {entry['name']:<35} | {entry.get('status_detail', '')}")
+
+
+def cmd_rename(vault: IrfHashVault, args: List[str]):
+    if len(args) < 2:
+        sys.stderr.write("Usage: irfhash rename <conn_id> <new_name>\n")
+        sys.exit(1)
+    cid = args[0]
+    new_name = " ".join(args[1:])
+    entry = vault.update_metadata(cid, {"name": new_name}, actor="cli-user")
+    print(f"Renamed {cid} -> '{entry['name']}'")
+
+
+def cmd_set_url(vault: IrfHashVault, args: List[str]):
+    if len(args) < 2:
+        sys.stderr.write("Usage: irfhash set-url <conn_id> <new_url>\n")
+        sys.exit(1)
+    cid, new_url = args[0], args[1]
+    entry = vault.update_metadata(cid, {"url": new_url}, actor="cli-user")
+    print(f"Updated URL for {cid} -> {entry['url']}")
+
+
+def cmd_set_policy(vault: IrfHashVault, args: List[str]):
+    if len(args) < 2:
+        sys.stderr.write(
+            "Usage: irfhash set-policy <conn_id> <ALLOW_READ_ASK_WRITE|ASK_EVERY_TIME|SESSION_15M|LOCKED>\n"
+        )
+        sys.exit(1)
+    cid, mode = args[0], args[1].upper()
+    entry = vault.update_metadata(cid, {"permission_mode": mode}, actor="cli-user")
+    print(f"Updated permission policy for {cid} -> {entry['permission_mode']}")
+
+
+def cmd_delete(vault: IrfHashVault, args: List[str]):
+    if not args:
+        sys.stderr.write("Usage: irfhash delete <conn_id>\n")
+        sys.exit(1)
+    ok = vault.delete_connection(args[0], actor="cli-user")
+    print(f"Deleted {args[0]}: {ok}")
+
+
+def cmd_audit(vault: IrfHashVault, args: List[str]):
+    limit = int(args[0]) if args else 30
+    logs = vault.get_audit_logs(limit)
+    for l in logs:
+        print(
+            f"{l['timestamp']} | {l['actor']:<14} | {l['action']:<18} | {l['connection_id']:<28} | {l['decision']:<18} | {l.get('detail', '')}"
+        )
+
+
+def main():
+    vault = IrfHashVault()
+    if len(sys.argv) < 2 or sys.argv[1] in ("list", "status", "ls"):
+        cmd_list(vault, sys.argv[2:])
+        return
+
+    sub = sys.argv[1]
+    rest = sys.argv[2:]
+    if sub in ("request", "req", "http"):
+        cmd_request(vault, rest)
+    elif sub == "add":
+        cmd_add(vault, rest)
+    elif sub == "scan":
+        cmd_scan(rest)
+    elif sub == "sanitize":
+        cmd_sanitize(vault, rest)
+    elif sub == "domain":
+        cmd_domain(vault, rest)
+    elif sub == "jira":
+        cmd_jira(vault, rest)
+    elif sub == "exec":
+        cmd_exec(vault, rest)
+    elif sub == "verify":
+        cmd_verify(vault, rest)
+    elif sub == "rename":
+        cmd_rename(vault, rest)
+    elif sub == "set-url":
+        cmd_set_url(vault, rest)
+    elif sub == "set-policy":
+        cmd_set_policy(vault, rest)
+    elif sub in ("delete", "rm", "remove"):
+        cmd_delete(vault, rest)
+    elif sub == "audit":
+        cmd_audit(vault, rest)
+    elif sub == "dashboard":
+        from dashboard_server import run_server
+
+        port = int(rest[0]) if rest else 8765
+        run_server(port)
+    else:
+        print("irfHASH: Isolated Runtime Fortress: Hardened Agentic Secret Hub")
+        print("Commands:")
+        print("  irfhash list                                    List all connections (safe metadata only)")
+        print("  irfhash scan [dirs...]                          Auto-discover & encrypt existing local credentials")
+        print("  irfhash add --id ID --name NAME --url URL ...   Add & encrypt a new connection from CLI/chat")
+        print("  irfhash sanitize [--dry-run]                    Redact raw secrets in AI chats with irfHASH pointers")
+        print("  irfhash domain <custom-domain> [--map-hosts]    Set custom local bookmarkable domain (e.g. irfhash.vault)")
+        print("  irfhash verify [id]                             Test if connections are ACTIVE or EXPIRED")
+        print("  irfhash request <id> <METHOD> <path> [-d body]  Execute authenticated HTTP call (scrubbed)")
+        print("  irfhash jira <jira-cli-args...>                 Run Jira CLI with encrypted token in memory")
+        print("  irfhash exec <id> <ENV_VAR> <cmd...>            Run command with secret in memory")
+        print("  irfhash rename <id> <new_name>                  Rename any connection")
+        print("  irfhash set-url <id> <new_url>                  Update connection URL")
+        print("  irfhash set-policy <id> <policy>                Update agent permission policy")
+        print("  irfhash delete <id>                             Remove connection and secret")
+        print("  irfhash audit [limit]                           Show hash-chained security audit log")
+        print("  irfhash dashboard [port]                        Launch localhost Control Center UI")
+
+
+if __name__ == "__main__":
+    main()

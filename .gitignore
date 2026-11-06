@@ -1,0 +1,9 @@
+# Never commit vault data, encrypted files, or environment files
+data/
+*.enc
+*.key
+.env*
+.creds
+__pycache__/
+*.pyc
+.DS_Store
